@@ -1,0 +1,8 @@
+version: '3'
+services:
+  go-base-server:
+    image: base-go-server
+    environment:
+      - DB_TIMEOUT=10s
+    ports:
+      - 8080:8080
