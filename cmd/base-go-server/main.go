@@ -3,25 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/jamesburns-rts/base-go-server/internal"
+	"github.com/jamesburns-rts/base-go-server/internal/db"
+	"github.com/jamesburns-rts/base-go-server/internal/log"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/jamesburns-rts/base-go-server/internal/api"
-	"github.com/jamesburns-rts/base-go-server/internal/api/middleware"
-	"github.com/jamesburns-rts/base-go-server/internal/clients/example"
 	"github.com/jamesburns-rts/base-go-server/internal/config"
-	"github.com/jamesburns-rts/base-go-server/internal/util"
 	"github.com/labstack/echo/v4"
-	echoMiddleware "github.com/labstack/echo/v4/middleware"
-	"github.com/labstack/gommon/log"
-	"github.com/pkg/errors"
 )
 
 // http://patorjk.com/software/taag/#p=display&f=ANSI%20Shadow&t=GO-SERVER
 func printBanner() {
-	v := util.Versions
 	fmt.Printf(`
 ...........................................................................
 ..██████╗..██████╗.......███████╗███████╗██████╗.██╗...██╗███████╗██████╗..
@@ -31,15 +28,13 @@ func printBanner() {
 .╚██████╔╝╚██████╔╝......███████║███████╗██║..██║.╚████╔╝.███████╗██║..██║.
 ..╚═════╝..╚═════╝.......╚══════╝╚══════╝╚═╝..╚═╝..╚═══╝..╚══════╝╚═╝..╚═╝.
 ...........................................................................
-Application base-go-server %s
-
-`, v.Version)
+`)
 
 	versions := map[string]string{
-		"Golang": v.Go,
-		"Branch": v.Git.Branch,
-		"Commit": v.Git.Commit,
-		"Echo":   v.Echo,
+		"Golang": internal.Versions.Go,
+		"Branch": internal.Versions.Git.Branch,
+		"Commit": internal.Versions.Git.Commit,
+		"Echo":   internal.Versions.Echo,
 	}
 	for k, v := range versions {
 		fmt.Printf("%s: %s\n", k, v)
@@ -56,22 +51,22 @@ type Server struct {
 }
 
 func main() {
+	printBanner()
 
 	props, err := config.ReadProperties()
 	if err != nil {
 		log.Fatal("failed to read properties ", err)
 	}
-	config.PrintProperties(props)
 
 	s, err := createServer(props)
 	if err != nil {
 		log.Fatal("unable to create server ", err)
 	}
 
-	printBanner()
 	// start server
 	go func() {
-		log.Fatal(s.Start(fmt.Sprintf("%s:%d", props.LocalHost, props.Port)))
+		err := s.Start(fmt.Sprintf("%s:%d", props.LocalHost, props.Port))
+		log.Fatal("start failed", err)
 	}()
 
 	s.waitAndShutdown()
@@ -83,39 +78,49 @@ func createServer(props config.Application) (s *Server, err error) {
 	// initial server setup
 	s = &Server{Echo: echo.New()}
 
-	// set up auth
-	if err := middleware.ConfigureAuth(props); err != nil {
-		return nil, errors.Wrap(err, "unable to configure auth")
+	// connect to database and migrate
+	dbc, err := db.Connect(props.Database)
+	if err != nil {
+		return nil, err
+	}
+	s.closeOnShutdown(dbc)
+
+	if err = db.Migrate(dbc.DB, props); err != nil {
+		s.closeAllClosers()
+		return nil, fmt.Errorf("error while migrating: %w", err)
 	}
 
-	// connect to database and migrate
-	// - none here
-
-	// tracing
-	tracer := middleware.SetupTracer(props)
-	s.closeOnShutdown(tracer)
-
-	// clients
-	exampleClient := example.NewClient(props)
+	middlewares, err := api.Middleware(props)
+	if err != nil {
+		s.closeAllClosers()
+		return nil, err
+	}
 
 	// configure server
-	s.Echo.Use(
-		echoMiddleware.Logger(),
-		echoMiddleware.Recover(),
-		middleware.ExampleClient(exampleClient),
-		middleware.Tracer(tracer),
-	)
+	s.Echo.Use(middlewares...)
 	s.Echo.HTTPErrorHandler = api.HTTPErrorHandler
-	s.Echo.Validator = util.Validator
 	s.Echo.HideBanner = true
-	s.Echo.Logger.SetLevel(props.EchoLogLevel())
-	s.Echo.Debug = s.Logger.Level() == log.DEBUG
-	log.SetLevel(props.EchoLogLevel())
-	util.Versions.Echo = echo.Version
+	s.Echo.Debug = strings.ToUpper(props.LogLevel) == "DEBUG"
+	internal.Versions.Echo = echo.Version
 
-	api.AddRoutes(s.Echo)
+	ctxCreator := api.NewEchoContextCreator(props, dbc)
+	s.addControllers(
+		api.NewManagementController(props, ctxCreator),
+		api.NewUsersController(props, ctxCreator),
+	)
 
 	return s, nil
+}
+
+type controller interface {
+	AddRoutes(e *echo.Group)
+}
+
+func (s *Server) addControllers(controllers ...controller) {
+	g := s.Echo.Group("")
+	for _, c := range controllers {
+		c.AddRoutes(g)
+	}
 }
 
 func (s *Server) waitAndShutdown() {
@@ -129,18 +134,23 @@ func (s *Server) waitAndShutdown() {
 	defer cancel()
 
 	if err := s.Shutdown(ctx); err != nil {
-		log.Fatal(err)
+		log.Error("failed to shutdown nicely", err)
 	}
 
-	for _, f := range s.closers {
-		if err := f.Close(); err != nil {
-			log.Warn(err)
-		}
-	}
+	s.closeAllClosers()
 
 	log.Info("exiting")
 }
 
 func (s *Server) closeOnShutdown(closer io.Closer) {
 	s.closers = append(s.closers, closer)
+}
+
+func (s *Server) closeAllClosers() {
+
+	for _, f := range s.closers {
+		if err := f.Close(); err != nil {
+			log.Error("failed to close closer", err)
+		}
+	}
 }

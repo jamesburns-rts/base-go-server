@@ -1,0 +1,8 @@
+build/
+README.md
+docker-compose.yml
+Dockerfile
+.env
+.github/
+.idea/
+*.iml
