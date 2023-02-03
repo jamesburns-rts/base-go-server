@@ -1,28 +1,44 @@
 package config
 
 import (
-	"fmt"
-	"reflect"
-	"strings"
-	"time"
-
 	"github.com/Netflix/go-env"
-	"github.com/labstack/gommon/log"
-	"github.com/pkg/errors"
+	"net/http"
+	"os"
 )
 
 type (
 	Application struct {
-		Port          int    `env:"APPLICATION_PORT"`
-		LocalHost     string `env:"APPLICATION_LOCAL_HOST"`
-		LogLevel      string `env:"APPLICATION_LOG_LEVEL"`
-		AuthEnabled   bool   `env:"APPLICATION_AUTH_ENABLED"`
-		ExampleClient ExampleClient
+		Port            int    `env:"APPLICATION_PORT"`
+		LocalHost       string `env:"APPLICATION_LOCAL_HOST"`
+		LogLevel        string `env:"APPLICATION_LOG_LEVEL"`
+		AuthEnabled     bool   `env:"APPLICATION_AUTH_ENABLED"`
+		CORSOrigins     string `env:"APPLICATION_CORS_ORIGINS"`
+		InitialPassword string `env:"APPLICATION_INITIAL_PASSWORD"`
+		Database        Database
+		JWT             JWT
+		ExampleClient   ExampleClient
+	}
+
+	Database struct {
+		Host       string `env:"DB_HOST"`
+		Port       int    `env:"DB_PORT"`
+		Database   string `env:"DB_DATABASE"`
+		Username   string `env:"DB_USERNAME" json:"-"`
+		Password   string `env:"DB_PASSWORD" json:"-"`
+		SSLDisable bool   `env:"DB_DISABLE_SSL"`
+	}
+
+	JWT struct {
+		RSAPrivateKey    string `env:"JWT_PRIVATE_KEY" json:"-"`
+		RASPublicKey     string `env:"JWT_PUBLIC_KEY"`
+		Lifespan         string `env:"JWT_LIFESPAN"`
+		ExpirationLeeway string `env:"JWT_EXPIRATION_LEEWAY"`
 	}
 
 	ExampleClient struct {
-		Url     string `env:"EXAMPLE_CLIENT_URL"`
-		Timeout string `env:"EXAMPLE_CLIENT_TIMEOUT"`
+		Url        string `env:"EXAMPLE_CLIENT_URL"`
+		DebugLevel string `env:"EXAMPLE_DEBUG_LEVEL"`
+		HttpClient *http.Client
 	}
 )
 
@@ -31,9 +47,24 @@ var Defaults = Application{
 	LocalHost:   "0.0.0.0",
 	LogLevel:    "INFO",
 	AuthEnabled: false,
+	CORSOrigins: "localhost:*",
+	Database: Database{
+		Host:       "localhost",
+		Port:       5432,
+		Database:   "mydb",
+		Username:   "localuser",
+		Password:   "supersecret",
+		SSLDisable: false,
+	},
+	JWT: JWT{
+		RSAPrivateKey:    TestPrivateKey,
+		RASPublicKey:     TestPublicKey,
+		Lifespan:         "1h",
+		ExpirationLeeway: "2m",
+	},
 	ExampleClient: ExampleClient{
-		Url:     "http://client:8080/api",
-		Timeout: "5s",
+		Url:        "https://pokeapi.co",
+		HttpClient: http.DefaultClient,
 	},
 }
 
@@ -47,85 +78,10 @@ func ReadProperties() (app Application, err error) {
 		return app, err
 	}
 
-	// check some string values
-	if _, err := time.ParseDuration(app.ExampleClient.Timeout); err != nil {
-		return app, errors.Wrap(err, "invalid example client timeout given")
+	// if ssl wasn't explicitly set, and we are running db locally, just disable it for convenience
+	if os.Getenv("DB_DISABLE_SSL") == "" {
+		app.Database.SSLDisable = app.Database.Host == "127.0.0.1"
 	}
 
 	return app, err
-}
-
-func (app Application) EchoLogLevel() log.Lvl {
-	switch strings.ToUpper(app.LogLevel) {
-	default:
-		return log.INFO
-	case "DEBUG":
-		return log.DEBUG
-	case "INFO":
-		return log.INFO
-	case "WARN":
-		return log.WARN
-	case "ERROR":
-		return log.ERROR
-	case "OFF":
-		return log.OFF
-	}
-}
-
-func PrintProperties(props Application) {
-
-	fmt.Println("\nApplication:")
-	if err := printPropertiesRecursive(&props, "  "); err != nil {
-		log.Warn("Unable to print rest of properties ", err)
-	}
-	fmt.Println()
-}
-
-func printPropertiesRecursive(v interface{}, indent string) error {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return errors.New("Pointer not given")
-	}
-
-	rv = rv.Elem()
-	if rv.Kind() != reflect.Struct {
-		return errors.New("Pointer to struct not given")
-	}
-
-	rt := reflect.Indirect(rv).Type()
-
-	t := rv.Type()
-	for i := 0; i < rv.NumField(); i++ {
-		valueField := rv.Field(i)
-		switch valueField.Kind() {
-		case reflect.Struct:
-			if !valueField.Addr().CanInterface() {
-				continue
-			}
-
-			iface := valueField.Addr().Interface()
-			fmt.Println(indent + rt.Field(i).Name + ":")
-			err := printPropertiesRecursive(iface, indent+"  ")
-			if err != nil {
-				return err
-			}
-		}
-
-		typeField := t.Field(i)
-		tag := typeField.Tag.Get("env")
-		if tag == "" {
-			continue
-		}
-
-		var value interface{}
-		if typeField.Tag.Get("hide") != "" {
-			value = "********"
-		} else {
-			value = valueField.Interface()
-		}
-
-		fmt.Println(indent+tag+":", value)
-	}
-
-	return nil
 }
